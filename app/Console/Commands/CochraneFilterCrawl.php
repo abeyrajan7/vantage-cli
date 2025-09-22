@@ -21,6 +21,7 @@ class CochraneFilterCrawl extends Command
 
     public function handle()
     {
+        //store fallback the necessary values to pass with the url
         $topic     = (string) $this->argument('topic');
         $topicSafe = $this->cleanFieldForPipes($topic);
         $start     = (int) $this->option('start');
@@ -29,14 +30,13 @@ class CochraneFilterCrawl extends Command
         $id = $this->resolveTopicIdFromLocal($topic);
         if (!$id) {
             $this->error("Could not find topic id for \"{$topic}\" in config/cochrane_topics.php");
-            // optional: suggest close matches
             $this->suggestClosestTopics($topic);
             return self::FAILURE;
         }
 
         // Base URL for Local development
         $baseUrl = rtrim(config('app.url'), '/') . '/fake/render_portlet';
-        
+
         // When running in production, uncomment the following line and comment out the one above.
         // The real URL is pulled from the COCHRANE_BASE_URL environment variable.
         // $baseUrl = config('cochrane.base_url');
@@ -45,8 +45,7 @@ class CochraneFilterCrawl extends Command
         // This array holds the non-changing parameters for the API request.
         // $fixedParams = config('cochrane.fixed_params');
 
-
-        // Write to BOTH storage/app and project root (easier to find on Windows)
+        // Write to BOTH storage/app and project root
         $disk         = Storage::disk('local');                      // storage/app
         $absStorage   = storage_path('app' . DIRECTORY_SEPARATOR . $outFile);
         $absProject   = base_path($outFile);                         // project root
@@ -74,7 +73,7 @@ class CochraneFilterCrawl extends Command
                 'facetDisplayName' => $topic,
                 'cur'              => $cur,
             ];
-            // To run the command with the full set of fixed parameters, uncommen
+            // To run the command with the full set of fixed parameters, uncomment
             // $query = array_merge($fixedParams, [
             //     'facetQueryTerm'   => $id,
             //     'searchText'       => $topic,
@@ -82,7 +81,7 @@ class CochraneFilterCrawl extends Command
             //     'facetDisplayName' => $topic,
             //     'cur'              => $cur,
             // ]);
-            
+
             //to check which api you are currently using:
             // $fullUrl = $baseUrl . '?' . http_build_query($query);
             // dd($fullUrl);
@@ -169,75 +168,57 @@ class CochraneFilterCrawl extends Command
     protected function parseReviewsToLines(string $html, string $topicSafe): array
     {
         $dom = new \DOMDocument();
-        // suppress warnings for malformed HTML
         @$dom->loadHTML($html, LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_NOCDATA);
-        $xp = new \DOMXPath($dom);
+        $xp  = new \DOMXPath($dom);
 
-        // Every item is anchored by the title link
-        $titleNodes = $xp->query("//h3[contains(concat(' ', normalize-space(@class), ' '), ' result-title ')]/a");
+        // 1) Pick a stable container selector for each result “card”
+        //    Add OR-clauses if your markup varies.
+        $items = $xp->query(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' search-result ')] |
+             //*[contains(concat(' ', normalize-space(@class), ' '), ' search-results-item ')] |
+             //*[contains(concat(' ', normalize-space(@class), ' '), ' result-item ')] |
+             //article[contains(@class,'result')] |
+             //li[contains(@class,'result')]"
+        );
 
         $lines = [];
 
-        foreach ($titleNodes as $a) {
-            /** @var \DOMElement $a */
-            $title = $this->cleanFieldForPipes($a->textContent ?? '');
-            $href  = trim($a->getAttribute('href') ?? '');
+        /** @var \DOMElement $item */
+        foreach ($items as $item) {
+            // 2) Title + link (required)
+            $aNode = $xp->query(".//h3[contains(concat(' ', normalize-space(@class), ' '), ' result-title ')]/a", $item)->item(0)
+                  ?: $xp->query(".//a[contains(@class,'result-title') or contains(@class,'search-result__title') or name()='a'][1]", $item)->item(0);
 
-            // Find a stable container for the rest of the fields
-            $container = $this->findItemRoot($a) ?: ($a->parentNode ? $a->parentNode->parentNode : null);
-
-            // AUTHORS
-            $authors = '';
-            if ($container instanceof \DOMElement) {
-                $authors = $this->firstTextByXPaths($container, [
-                    "div[contains(@class,'search-result-authors')]//div",
-                    ".//div[contains(@class,'search-result-authors')]//div",
-                    ".//*[contains(@class,'search-result-authors')]//div",
-                    ".//div[contains(@class,'result-authors')]",
-                    ".//span[contains(@class,'authors')]",
-                ], $xp);
-
-                // fallback: look near the title
-                if ($authors === '') {
-                    $authorsNode = $xp->query("./following::div[contains(@class,'search-result-authors')]//div[1]", $a->parentNode);
-                    if ($authorsNode && $authorsNode->length) {
-                        $authors = $this->cleanText($authorsNode->item(0)->textContent);
-                    }
-                }
-            }
-            $authors = $this->cleanFieldForPipes($authors);
-
-            // DATE
-            $dateIso = '';
-            if ($container instanceof \DOMElement) {
-                $dateText = $this->firstTextByXPaths($container, [
-                    "div[contains(@class,'search-result-date')]//div",
-                    ".//div[contains(@class,'search-result-date')]//div",
-                    ".//*[contains(@class,'search-result-date')]//div",
-                    ".//div[contains(@class,'result-date')]",
-                    ".//time/@datetime",
-                    ".//time",
-                ], $xp);
-
-                if ($dateText === '') {
-                    $time = $this->queryOneWithin($container, ".//time", $xp);
-                    if ($time) {
-                        $dateText = $this->cleanText($time->getAttribute('datetime') ?: $time->textContent);
-                    }
-                }
-                if ($dateText === '') {
-                    $dateNode = $xp->query("./following::div[contains(@class,'search-result-date')]//div[1]", $a->parentNode);
-                    if ($dateNode && $dateNode->length) {
-                        $dateText = $this->cleanText($dateNode->item(0)->textContent);
-                    }
-                }
-                $dateIso = $this->toIsoDate($dateText); // "28 February 2013" -> "2013-02-28"
+            if (!$aNode instanceof \DOMElement) {
+                // No title/link → skip this card
+                continue;
             }
 
-            // LINK
-            $link = $this->normalizeWileyHref($href);
+            $title = $this->cleanFieldForPipes($aNode->textContent ?? '');
+            $href  = trim($aNode->getAttribute('href') ?? '');
+            $link  = $this->normalizeWileyHref($href);
 
-            // Compose line
+            // 3) Authors (nice-to-have)
+            $authorsNode =
+                $xp->query(".//*[contains(@class,'search-result-authors')]//div[1]", $item)->item(0)
+             ?: $xp->query(".//*[contains(@class,'result-authors')][1]", $item)->item(0)
+             ?: $xp->query(".//*[contains(@class,'authors')][1]", $item)->item(0);
+
+            $authors = $this->cleanFieldForPipes($this->cleanText($authorsNode?->textContent ?? ''));
+
+            // 4) Date (look for <time> first, then fallback to date div)
+            $timeAttr = $xp->query(".//time/@datetime", $item)->item(0);
+            $timeEl   = $xp->query(".//time", $item)->item(0);
+            $dateDiv  = $xp->query(".//*[contains(@class,'search-result-date')]//div[1] | .//*[contains(@class,'result-date')][1]", $item)->item(0);
+
+            $rawDateText =
+                  ($timeAttr?->value ?? '')
+               ?: ($timeEl?->textContent ?? '')
+               ?: ($dateDiv?->textContent ?? '');
+
+            $dateIso = $this->toIsoDate($this->cleanText($rawDateText));
+
+            // 5) Compose pipe line
             $lines[] = "{$link}|{$topicSafe}|{$title}|{$authors}|{$dateIso}";
         }
 
@@ -254,13 +235,12 @@ class CochraneFilterCrawl extends Command
             return $href;
         }
 
-        // /cdsr/doi/10.1002/XXXX/full -> http://onlinelibrary.wiley.com/doi/10.1002/XXXX/full
         $href = preg_replace('#^/cdsr/doi/#i', '/doi/', $href);
 
         return 'http://onlinelibrary.wiley.com' . $href;
     }
 
-    /** Collapse whitespace and trim. */
+//     Collapse whitespace and trim.
     protected function cleanText(string $s): string
     {
         $s = preg_replace('/\s+/u', ' ', $s ?? '');
@@ -274,7 +254,7 @@ class CochraneFilterCrawl extends Command
         return str_replace('|', ' - ', $s);
     }
 
-    /** Convert many human date shapes to YYYY-MM-DD; fallback to original if parsing fails. */
+//Convert many human date shapes to YYYY-MM-DD; fallback to original if parsing fails.
     protected function toIsoDate(string $human): string
     {
         $human = trim(preg_replace('/\s+/u', ' ', $human));
@@ -299,7 +279,7 @@ class CochraneFilterCrawl extends Command
         return $human; // fallback
     }
 
-    /** Run an XPath query scoped to a given element (use the element as the context node). */
+//     Run an XPath query scoped to a given element (use the element as the context node).
     protected function queryOneWithin(\DOMElement $context, string $relXpath, \DOMXPath $xp): ?\DOMNode
     {
         $rel = trim($relXpath);
@@ -308,42 +288,5 @@ class CochraneFilterCrawl extends Command
         if (!str_starts_with($rel, '.') && !str_starts_with($rel, '/')) $rel = './/' . $rel;
         $nodes = @$xp->query($rel, $context);
         return ($nodes && $nodes->length) ? $nodes->item(0) : null;
-    }
-
-    /** Try multiple relative XPaths (scoped to $context) and return the first non-empty text. */
-    protected function firstTextByXPaths(\DOMElement $context, array $xpaths, \DOMXPath $xp): string
-    {
-        foreach ($xpaths as $relXpath) {
-            $node = $this->queryOneWithin($context, $relXpath, $xp);
-            if ($node instanceof \DOMAttr) {
-                $txt = $this->cleanText($node->value);
-            } else {
-                $txt = $this->cleanText($node?->textContent ?? '');
-            }
-            if ($txt !== '') return $txt;
-        }
-        return '';
-    }
-
-    /** Walk up to find a reasonable container for one search result item. */
-    protected function findItemRoot(\DOMNode $node): ?\DOMElement
-    {
-        $n = $node;
-        while ($n) {
-            if ($n instanceof \DOMElement) {
-                $cls = ' ' . preg_replace('/\s+/', ' ', $n->getAttribute('class')) . ' ';
-                if (
-                    str_contains($cls, ' search-result ') ||
-                    str_contains($cls, ' search-results-item ') ||
-                    str_contains($cls, ' result ') ||
-                    str_contains($cls, ' result-item ') ||
-                    in_array($n->tagName, ['article','li'], true)
-                ) {
-                    return $n;
-                }
-            }
-            $n = $n->parentNode;
-        }
-        return null;
     }
 }
